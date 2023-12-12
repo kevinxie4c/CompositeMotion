@@ -56,7 +56,8 @@ class Env(object):
         self.camera_pos = self.CAMERA_POS
         self.camera_following = self.CAMERA_FOLLOWING
         if graphics_device is None:
-            graphics_device = compute_device
+            #graphics_device = compute_device
+            graphics_device = -1
         self.character_model = self.CHARACTER_MODEL if character_model is None else character_model
 
         sim_params = self.setup_sim_params()
@@ -1554,3 +1555,313 @@ def observe_iccgan_juggling_target(state_hist: torch.Tensor, seq_len: torch.Tens
     ball_state_n = torch.cat((ball_pos, ball_lin_vel), -1)
 
     return torch.cat((ob, ball_state_l, ball_state_r, ball_state_n, timer.unsqueeze_(-1)), -1)
+
+
+class ICCGANR15(Env):
+
+    CHARACTER_MODEL = "assets/r15_blocky.xml"
+    CONTROLLABLE_LINKS = ["UpperTorso", "Head", 
+        "LeftUpperArm", "LeftLowerArm",
+        "RightUpperArm", "RightLowerArm", 
+        "LeftUpperLeg", "LeftLowerLeg", "LeftFoot",
+        "RightUpperLeg", "RightLowerLeg", "RightFoot"]
+    DOFS =  [3, 3, 3, 1, 3, 1, 3, 1, 3, 3, 1, 3]
+    CONTACTABLE_LINKS = ["LeftFoot", "RightFoot"]
+    UP_AXIS = 1
+
+    GOAL_DIM = 0
+    GOAL_REWARD_WEIGHT = None
+    ENABLE_GOAL_TIMER = False
+    GOAL_TENSOR_DIM = None
+
+    OB_HORIZON = 4
+    KEY_LINKS = None    # All links
+    PARENT_LINK = None  # root link
+
+
+    def __init__(self, *args,
+        motion_file: str,
+        discriminators: Dict[str, DiscriminatorConfig],
+    **kwargs):
+        contactable_links = parse_kwarg(kwargs, "contactable_links", self.CONTACTABLE_LINKS)
+        controllable_links = parse_kwarg(kwargs, "controllable_links", self.CONTROLLABLE_LINKS)
+        dofs = parse_kwarg(kwargs, "dofs", self.DOFS)
+        goal_reward_weight = parse_kwarg(kwargs, "goal_reward_weight", self.GOAL_REWARD_WEIGHT)
+        self.enable_goal_timer = parse_kwarg(kwargs, "enable_goal_timer", self.ENABLE_GOAL_TIMER)
+        self.goal_tensor_dim = parse_kwarg(kwargs, "goal_tensor_dim", self.GOAL_TENSOR_DIM)
+        self.ob_horizon = parse_kwarg(kwargs, "ob_horizon", self.OB_HORIZON)
+        self.key_links = parse_kwarg(kwargs, "key_links", self.KEY_LINKS)
+        self.parent_link = parse_kwarg(kwargs, "parent_link", self.PARENT_LINK)
+        super().__init__(*args, **kwargs)
+
+        n_envs = len(self.envs)
+        n_links = self.char_link_tensor.size(1)
+        n_dofs = self.char_joint_tensor.size(1)
+        
+        controllable_links = [self.gym.find_actor_rigid_body_handle(self.envs[0], self.actors[0], link)
+            for link in controllable_links]
+
+        if contactable_links is None:
+            self.contactable_links = None
+        elif contactable_links:
+            contact = np.zeros((n_envs, n_links), dtype=bool)
+            for link in contactable_links:
+                lid = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actors[0], link)
+                assert(lid >= 0), "Unrecognized contactable link {}".format(link)
+                contact[:, lid] = True
+            self.contactable_links = torch.tensor(contact).to(self.contact_force_tensor.device)
+        else:
+            self.contactable_links = False
+
+        init_pose = motion_file
+        self.ref_motion = ReferenceMotion(motion_file=init_pose, character_model=self.character_model,
+            key_links=np.arange(n_links), controllable_links=controllable_links, dofs=dofs,
+            device=self.device
+        )
+
+        ref_motion = {init_pose: self.ref_motion}
+        disc_ref_motion = dict()
+        for id, config in discriminators.items():
+            m = init_pose if config.motion_file is None else config.motion_file
+            if m not in ref_motion:
+                ref_motion[m] = ReferenceMotion(motion_file=m, character_model=self.character_model,
+                    key_links=np.arange(n_links), controllable_links=controllable_links, dofs=dofs,
+                    device=self.device
+                )
+            key = (ref_motion[m], config.replay_speed)
+            if config.ob_horizon is None:
+                config.ob_horizon = self.ob_horizon+1
+            if key not in disc_ref_motion: disc_ref_motion[key] = [0, []]
+            disc_ref_motion[key][0] = max(disc_ref_motion[key][0], config.ob_horizon)
+            disc_ref_motion[key][1].append(id)
+
+        if goal_reward_weight is not None:
+            reward_weights = torch.empty((len(self.envs), self.rew_dim), dtype=torch.float32, device=self.device)
+            if not hasattr(goal_reward_weight, "__len__"):
+                goal_reward_weight = [goal_reward_weight]
+            assert(self.rew_dim == len(goal_reward_weight))
+            for i, w in zip(range(self.rew_dim), goal_reward_weight):
+                reward_weights[:, i] = w
+        elif self.rew_dim:
+            goal_reward_weight = []
+            assert(self.rew_dim == len(goal_reward_weight))
+
+        n_comp = len(discriminators) + self.rew_dim
+        if n_comp > 1:
+            self.reward_weights = torch.zeros((n_envs, n_comp), dtype=torch.float32, device=self.device)
+            weights = [disc.weight for _, disc in discriminators.items() if disc.weight is not None]
+            total_weights = sum(weights) if weights else 0
+            assert(total_weights <= 1), "Discriminator weights must not be greater than 1."
+            n_unassigned = len(discriminators) - len(weights)
+            rem = 1 - total_weights
+            for disc in discriminators.values():
+                if disc.weight is None:
+                    disc.weight = rem / n_unassigned
+                elif n_unassigned == 0:
+                    disc.weight /= total_weights
+        else:
+            self.reward_weights = None
+
+        self.discriminators = dict()
+        max_ob_horizon = self.ob_horizon+1
+        for i, (id, config) in enumerate(discriminators.items()):
+            key_links = None if config.key_links is None else sorted([
+                self.gym.find_actor_rigid_body_handle(self.envs[0], self.actors[0], link) for link in config.key_links
+            ])
+            parent_link = None if config.parent_link is None else \
+                self.gym.find_actor_rigid_body_handle(self.envs[0], self.actors[0], config.parent_link)
+
+            assert(key_links is None or all(lid >= 0 for lid in key_links))
+            assert(parent_link is None or parent_link >= 0)
+            
+            self.discriminators[id] = DiscriminatorProperty(
+                name = id,
+                key_links = key_links,
+                parent_link = parent_link,
+                replay_speed = config.replay_speed,
+                ob_horizon = config.ob_horizon,
+                id=i
+            )
+            if self.reward_weights is not None:
+                self.reward_weights[:, i] = config.weight
+            max_ob_horizon = max(max_ob_horizon, config.ob_horizon)
+
+        if max_ob_horizon != self.state_hist.size(0):
+            self.state_hist = torch.empty((max_ob_horizon, *self.state_hist.shape[1:]),
+                dtype=self.root_tensor.dtype, device=self.device)
+        self.disc_ref_motion = [
+            (ref_motion, replay_speed, max_ob_horizon, [self.discriminators[id] for id in disc_ids])
+            for (ref_motion, replay_speed), (max_ob_horizon, disc_ids) in disc_ref_motion.items()
+        ]
+
+        if self.rew_dim > 0:
+            if self.rew_dim > 1:
+                self.reward_weights *= (1-reward_weights.sum(dim=-1, keepdim=True))
+            else:
+                self.reward_weights *= (1-reward_weights)
+            self.reward_weights[:, -self.rew_dim:] = reward_weights
+            
+        self.info["ob_seq_lens"] = torch.zeros_like(self.lifetime)  # dummy result
+        self.info["disc_obs"] = self.observe_disc(self.state_hist)  # dummy result
+        self.info["disc_obs_expert"] = self.info["disc_obs"]        # dummy result
+        self.goal_dim = self.GOAL_DIM
+        self.state_dim = (self.ob_dim-self.goal_dim)//self.ob_horizon
+        self.disc_dim = {
+            name: ob.size(-1)
+            for name, ob in self.info["disc_obs"].items()
+        }
+    
+    def reset_done(self):
+        obs, info = super().reset_done()
+        info["ob_seq_lens"] = self.ob_seq_lens
+        info["reward_weights"] = self.reward_weights
+        return obs, info
+    
+    def reset(self):
+        if self.goal_tensor is not None:
+            self.goal_tensor.zero_()
+            if self.goal_timer is not None: self.goal_timer.zero_()
+        super().reset()
+
+    def reset_envs(self, env_ids):
+        super().reset_envs(env_ids)
+        self.reset_goal(env_ids)
+        
+    def reset_goal(self, env_ids):
+        pass
+    
+    def step(self, actions):
+        self.state_hist[:-1] = self.state_hist[1:].clone()
+        obs, rews, dones, info = super().step(actions)
+        info["disc_obs"] = self.observe_disc(self.state_hist)
+        info["disc_obs_expert"], info["disc_seq_len"] = self.fetch_real_samples()
+        return obs, rews, dones, info
+
+    def overtime_check(self):
+        if self.goal_timer is not None:
+            self.goal_timer -= 1
+            env_ids = torch.nonzero(self.goal_timer <= 0).view(-1)
+            if len(env_ids) > 0: self.reset_goal(env_ids)
+        return super().overtime_check()
+
+    def termination_check(self):
+        if self.contactable_links is None:
+            return torch.zeros_like(self.done)
+        masked_contact = self.char_contact_force_tensor.clone()
+        if self.contactable_links is not False:
+            masked_contact[self.contactable_links] = 0          # N x n_links x 3
+
+        contacted = torch.any(masked_contact > 1., dim=-1)  # N x n_links
+        too_low = self.link_pos[..., self.UP_AXIS] < 0.15    # N x n_links
+
+        terminate = torch.any(torch.logical_and(contacted, too_low), -1)    # N x
+        terminate *= (self.lifetime > 1)
+        return terminate
+
+    def init_state(self, env_ids):
+        motion_ids, motion_times = self.ref_motion.sample(len(env_ids))
+        return self.ref_motion.state(motion_ids, motion_times)
+    
+    def create_tensors(self):
+        super().create_tensors()
+        n_dofs = self.gym.get_actor_dof_count(self.envs[0], 0)
+        n_links = self.gym.get_actor_rigid_body_count(self.envs[0], 0)
+        self.root_pos, self.root_orient = self.root_tensor[:, 0, :3], self.root_tensor[:, 0, 3:7]
+        self.root_lin_vel, self.root_ang_vel = self.root_tensor[:, 0, 7:10], self.root_tensor[:, 0, 10:13]
+        self.char_root_tensor = self.root_tensor[:, 0]
+        if self.link_tensor.size(1) > n_links:
+            self.link_pos, self.link_orient = self.link_tensor[:, :n_links, :3], self.link_tensor[:, :n_links, 3:7]
+            self.link_lin_vel, self.link_ang_vel = self.link_tensor[:, :n_links, 7:10], self.link_tensor[:, :n_links, 10:13]
+            self.char_link_tensor = self.link_tensor[:, :n_links]
+        else:
+            self.link_pos, self.link_orient = self.link_tensor[..., :3], self.link_tensor[..., 3:7]
+            self.link_lin_vel, self.link_ang_vel = self.link_tensor[..., 7:10], self.link_tensor[..., 10:13]
+            self.char_link_tensor = self.link_tensor
+        if self.joint_tensor.size(1) > n_dofs:
+            self.joint_pos, self.joint_vel = self.joint_tensor[:, :n_dofs, 0], self.joint_tensor[:, :n_dofs, 1]
+            self.char_joint_tensor = self.joint_tensor[:, :n_dofs]
+        else:
+            self.joint_pos, self.joint_vel = self.joint_tensor[..., 0], self.joint_tensor[..., 1]
+            self.char_joint_tensor = self.joint_tensor
+        
+        self.char_contact_force_tensor = self.contact_force_tensor[:, :n_links]
+    
+        self.state_hist = torch.empty((self.ob_horizon+1, len(self.envs), 13 + n_links*13),
+            dtype=self.root_tensor.dtype, device=self.device)
+
+        self.key_links = None if self.key_links is None else sorted([
+            self.gym.find_actor_rigid_body_handle(self.envs[0], self.actors[0], link) for link in self.key_links
+        ])
+        
+        if self.goal_tensor_dim:
+            try:
+                self.goal_tensor = [
+                    torch.zeros((len(self.envs), dim), dtype=self.root_tensor.dtype, device=self.device)
+                    for dim in self.goal_tensor_dim
+                ]
+            except TypeError:
+                self.goal_tensor = torch.zeros((len(self.envs), self.goal_tensor_dim), dtype=self.root_tensor.dtype, device=self.device)
+        else:
+            self.goal_tensor = None
+        self.goal_timer = torch.zeros((len(self.envs), ), dtype=torch.int32, device=self.device) if self.enable_goal_timer else None
+
+    def observe(self, env_ids=None):
+        self.ob_seq_lens = self.lifetime+1 #(self.lifetime+1).clip(max=self.state_hist.size(0)-1)
+        n_envs = len(self.envs)
+        if env_ids is None or len(env_ids) == n_envs:
+            self.state_hist[-1] = torch.cat((
+                self.char_root_tensor, self.char_link_tensor.view(n_envs, -1)
+            ), -1)
+            env_ids = None
+        else:
+            n_envs = len(env_ids)
+            self.state_hist[-1, env_ids] = torch.cat((
+                self.char_root_tensor[env_ids], self.char_link_tensor[env_ids].view(n_envs, -1)
+            ), -1)
+        return self._observe(env_ids)
+    
+    def _observe(self, env_ids):
+        if env_ids is None:
+            return observe_iccgan(
+                self.state_hist[-self.ob_horizon:], self.ob_seq_lens, self.key_links, self.parent_link
+            ).flatten(start_dim=1)
+        else:
+            return observe_iccgan(
+                self.state_hist[-self.ob_horizon:][:, env_ids], self.ob_seq_lens[env_ids], self.key_links, self.parent_link
+            ).flatten(start_dim=1)
+    
+    def observe_disc(self, state):
+        seq_len = self.info["ob_seq_lens"]+1
+        res = dict()
+        if torch.is_tensor(state):
+            # fake
+            for id, disc in self.discriminators.items():
+                res[id] = observe_iccgan(state[-disc.ob_horizon:], seq_len, disc.key_links, disc.parent_link, include_velocity=False)
+            return res
+        else:
+            # real
+            seq_len_ = dict()
+            for disc_name, s in state.items():
+                disc = self.discriminators[disc_name]
+                res[disc_name] = observe_iccgan(s[-disc.ob_horizon:], seq_len, disc.key_links, disc.parent_link, include_velocity=False)
+                seq_len_[disc_name] = seq_len
+            return res, seq_len_
+
+    def fetch_real_samples(self):
+        n_inst = len(self.envs)
+
+        samples = dict()
+        for ref_motion, replay_speed, ob_horizon, discs in self.disc_ref_motion:
+            dt = self.step_time
+            if replay_speed is not None:
+                dt /= replay_speed(n_inst)
+            motion_ids, motion_times0 = ref_motion.sample(n_inst, truncate_time=dt*(ob_horizon-1))
+            motion_ids = np.tile(motion_ids, ob_horizon)
+            motion_times = np.concatenate((motion_times0, *[motion_times0+dt*i for i in range(1, ob_horizon)]))
+            root_tensor, link_tensor, joint_tensor = ref_motion.state(motion_ids, motion_times)
+            real = torch.cat((
+                root_tensor, link_tensor.view(root_tensor.size(0), -1)
+            ), -1).view(ob_horizon, n_inst, -1)
+
+            for d in discs: samples[d.name] = real
+        return self.observe_disc(samples)
