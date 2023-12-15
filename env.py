@@ -4,7 +4,7 @@ import os
 from isaacgym import gymapi, gymtorch
 import torch
 
-from utils import heading_zup, axang2quat, rotatepoint, quatconj, quatmultiply, quatdiff_normalized
+from utils import heading_zup, axang2quat, rotatepoint, quatconj, quatmultiply, quatdiff_normalized, rotvec2quat
 
 def parse_kwarg(kwargs: dict, key: str, default_val: Any):
     return kwargs[key] if key in kwargs else default_val
@@ -412,6 +412,39 @@ class Env(object):
 
     def reward(self):
         return torch.ones((len(self.envs), 0), dtype=torch.float32, device=self.device)
+
+    def pose2blender(self, env_id=0, flag=False):
+        root_pos = self.root_pos[env_id].cpu().tolist()
+        root_orient = self.root_orient[env_id].cpu().tolist()
+        joint_pos = self.joint_pos[env_id]
+
+        pose = {
+            "base": [
+                root_pos[0], root_pos[1], root_pos[2],
+                root_orient[3], root_orient[0], root_orient[2], -root_orient[1]
+            ]
+        }
+        dof = self.gym.get_actor_dof_dict(self.envs[env_id], 0)
+        x_ref = torch.zeros((3, ), dtype=joint_pos.dtype, device=joint_pos.device)
+        x_ref[0] = 1
+        for n in [
+            "RightHip", "RightKnee", "RightAnkle", "LeftHip", "LeftKnee", "LeftAnkle", "Waist", "LeftShoulder", "LeftElbow", "RightShoulder", "RightElbow", "Neck"
+        ]:
+            if "Elbow" in n or "Knee" in n:
+                q = axang2quat(x_ref, joint_pos[dof[n+"_x"]])
+                # if flag:
+                #     print(joint_pos[dof[n]], q)
+                q = q.cpu().tolist()
+                pose[n] = [q[3], q[0], q[1], q[2]]
+            else:
+                if n+"_x" in dof:
+                    idx = min([dof[n+"_x"], dof[n+"_y"], dof[n+"_z"]])
+                    q = rotvec2quat(joint_pos[idx:idx+3])
+                    q = q.cpu().tolist()
+                    pose[n] = [q[3], q[0], q[1], q[2]]
+                else:
+                    pose[n] = [1, 0, 0, 0]
+        return dict(pose=pose)
 
 
 from ref_motion import ReferenceMotion

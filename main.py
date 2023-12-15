@@ -11,6 +11,9 @@ import random
 from torch.utils.tensorboard import SummaryWriter
 
 import argparse
+
+import pickle
+
 parser = argparse.ArgumentParser()
 parser.add_argument("config", type=str,
     help="Configure file used for training. Please refer to files in `config` folder.")
@@ -55,11 +58,16 @@ TRAINING_PARAMS = dict(
 def test(env, model):
     model.eval()
     env.reset()
-    while not env.request_quit:
+    blender = []
+    frame = 0
+    while frame < 200:
         obs, info = env.reset_done()
         seq_len = info["ob_seq_lens"]
         actions = model.act(obs, seq_len-1)
         env.step(actions)
+        blender.append(env.pose2blender())
+        frame += 1
+    pickle.dump(blender, open('r15_walk.blender_dat', 'wb'))
 
 
 def train(env, model, ckpt_dir, training_params):
@@ -391,7 +399,7 @@ if __name__ == "__main__":
         **config.env_params
     )
     if settings.test:
-        env.episode_length = 500000
+        env.episode_length = 500
 
     value_dim = len(env.discriminators)+env.rew_dim
     model = ACModel(env.state_dim, env.act_dim, env.goal_dim, value_dim)

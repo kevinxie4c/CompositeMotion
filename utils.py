@@ -47,6 +47,21 @@ def quatconj(q: torch.Tensor):
     return torch.cat((-q[...,:3], q[...,-1:]), dim=-1)
 
 @torch.jit.script
+def rotvec2quat(rotvec: torch.Tensor) -> torch.Tensor:
+    angle = rotvec.norm(p=2, dim=-1, keepdim=True)
+    axis = rotvec / angle
+    ref_angle = torch.zeros_like(angle)
+    ref_axis = torch.zeros_like(rotvec)
+    ref_axis[..., 0] = 1
+    axis = torch.where(angle < 1e-5, ref_axis, axis)
+    angle = torch.where(angle < 1e-5, ref_angle, angle)
+
+    theta = angle / 2
+    xyz = axis * torch.sin(theta)
+    w = torch.cos(theta)
+    return quatnormalize(torch.cat((xyz, w), -1))
+
+@torch.jit.script
 def axang2quat(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
     # axis: n x 3
     # angle: n
